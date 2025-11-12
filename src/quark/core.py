@@ -51,7 +51,7 @@ class Failed:
     reason: str
 
 
-Result = Sleep | Backtrack | Data | Failed
+Result = Sleep | Backtrack | Data | Failed | Backtrack
 
 
 class Core(ABC):
@@ -103,7 +103,6 @@ class Core(ABC):
         """
         return None
 
-    # def handle_backtrack(self, data: Any) -> Result:
-    #     """Override this method if you want to handle backtracking from a child node."""
-    #     raise notImplementedError("One of the child nodes tried to backtrack,
-    #     but the parent module does not override handle_backtrack")
+     
+    def handle_backtrack(self, data: Any) -> Result:
+        return NotImplementedError

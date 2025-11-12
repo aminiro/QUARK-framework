@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from itertools import chain
+from itertools import chain, tee
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -95,6 +95,14 @@ class FinishedPipelineRun:
     steps: list[ModuleRunMetrics]
 
 
+
+@dataclass(frozen=True)
+class BacktrackedPipelineRun:
+    """An in-progress pipeline run that was not interrupted or paused yet, used by run_pipeline_tree.imp()."""
+    backtracked_node : ModuleNode
+    downstream_data: Any  # The result of a child node's postprocessing step
+    metrics_up_to_now: list[ModuleRunMetrics]  # The aggregated metrics from all modules included in this pipeline.
+
 @dataclass(frozen=True)
 class InProgressPipelineRun:
     """An in-progress pipeline run that was not interrupted or paused yet, used by run_pipeline_tree.imp()."""
@@ -116,7 +124,7 @@ class FailedPipelineRun:
     metrics_up_to_now: list[ModuleRunMetrics]
 
 
-PipelineRunStatus = InProgressPipelineRun | PausedPipelineRun | FailedPipelineRun
+PipelineRunStatus = InProgressPipelineRun | PausedPipelineRun | FailedPipelineRun | BacktrackedPipelineRun
 # === Pipeline Run Progress ===
 
 
@@ -163,6 +171,8 @@ class ModuleNode(NodeMixin):
 
     interrupted_during_postprocess = False
     data_stored_by_postprocess_interrupt: list[InProgressPipelineRun] | None = None
+
+    backtracked : bool = False
 
     def __init__(self, module_info: ModuleInfo, parent: ModuleNode | None = None) -> None:
         """Initialize a ModuleNode.
@@ -251,16 +261,58 @@ def run_pipeline_tree(pipeline_tree: ModuleNode, *, failfast: bool = False) -> T
             if node.children
             else iter([[InProgressPipelineRun(downstream_data=None, metrics_up_to_now=[])]])
         )
+        downstream_results, backtracked_results = tee(downstream_results)
         # This decides if the recursion continues or stops depending on if there are children left
         if node.data_stored_by_postprocess_interrupt is not None:
             downstream_results = chain(downstream_results, iter([node.data_stored_by_postprocess_interrupt]))
             # Handles postprocessing sleeps
 
-        for downstream_result in downstream_results: # TODO case distinction for backtracked pipeline runs
-            # case backtracked_pipeline_run(data):
-            #     backtrack_result = module.handle_backtrack(data)
-            #     call its own handle_backtrack function (backtracked_pipeline_run.preprocessed_data)
-            # case all good (backtracking over or no backtracking needed):
+        for backtracked_result in backtracked_results:
+
+            set_logging_depth(depth)
+            for pipeline_run_status in backtracked_result:
+                match pipeline_run_status:
+                    case status if isinstance(status, (PausedPipelineRun, FailedPipelineRun)):
+                        results.append(status)
+                    case BacktrackedPipelineRun(backtracked_node, downstream_data, metrics_up_to_now):
+                        logging.info(f"Running postprocess for module {node.module_info}")
+                        try:
+                            t1 = perf_counter()
+                            backtracking_result = backtracked_node.module.handle_backtrack(downstream_data)  # Postprocessing step
+                        except Exception as e:
+                            if failfast:
+                                raise
+                            logging.exception("")
+                            results.append(FailedPipelineRun(reason=str(e), metrics_up_to_now=metrics_up_to_now))
+                        else:
+                            match backtracking_result:
+                                case Sleep(stored_data):
+                                    # TODO
+                                    raise NotImplementedError
+                                case Backtrack(_):
+                                    # TODO
+                                    raise NotImplementedError
+                                case Failed(reason):
+                                    logging.error(reason)
+                                    results.append(
+                                        FailedPipelineRun(reason=reason, metrics_up_to_now=metrics_up_to_now),
+                                    )
+                                case Data(postprocessed_data):
+                                    postprocess_time = perf_counter() - t1
+                                    logging.info(
+                                        f"Backtrack for module {node.module_info} took {postprocess_time} seconds",
+                                    )
+                                    downstream_results = chain(iter([[InProgressPipelineRun(
+                                        downstream_data=postprocessed_data,
+                                        metrics_up_to_now=metrics_up_to_now,
+                                    )]])
+                                    ,downstream_results)
+                                    backtracked_node.backtracked= False
+                                case _:
+                                    msg = "The backtracking function must return a Result type"
+                                    raise TypeError(msg)
+
+        for downstream_result in downstream_results: 
             set_logging_depth(depth)
             for pipeline_run_status in downstream_result:
                 match pipeline_run_status:
@@ -281,9 +333,14 @@ def run_pipeline_tree(pipeline_tree: ModuleNode, *, failfast: bool = False) -> T
                                 case Sleep(stored_data):
                                     # TODO
                                     raise NotImplementedError
-                                case Backtrack():
-                                    # TODO
-                                    raise NotImplementedError
+                                case Backtrack(data):
+                                    results.append(
+                                        BacktrackedPipelineRun(
+                                            backtracked_node=node,
+                                            downstream_data=data,
+                                            metrics_up_to_now=[*metrics_up_to_now],
+                                        ),
+                                    )
                                 case Failed(reason):
                                     logging.error(reason)
                                     results.append(
@@ -317,7 +374,7 @@ def run_pipeline_tree(pipeline_tree: ModuleNode, *, failfast: bool = False) -> T
     finished_pipeline_runs = [
         FinishedPipelineRun(result=r.downstream_data, steps=r.metrics_up_to_now)
         for r in results
-        if isinstance(r, InProgressPipelineRun)
+        if isinstance(r, InProgressPipelineRun) or isinstance(r, BacktrackedPipelineRun)
     ]
 
     if any(isinstance(r, (PausedPipelineRun, FailedPipelineRun)) for r in results):
